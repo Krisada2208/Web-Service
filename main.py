@@ -2,10 +2,10 @@ import os
 import joblib
 import pandas as pd
 import numpy as np
+from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from typing import Dict, Any, List
 from supabase import create_client, Client
-from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="NCD Progression AI Service")
 
@@ -21,7 +21,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print(f"⚠️ ไม่สามารถเชื่อมต่อ Supabase ได้: {e}")
 
-# 2. โหลดโมเดล
+# 2. โหลดโมเดล XGBoost
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "model", "ncd_progression_xgb.joblib")
 FEATURE_PATH = os.path.join(BASE_DIR, "model", "progression_features.joblib")
@@ -50,6 +50,7 @@ batch_tracker = {
 }
 
 def safe_float(val, default=0.0):
+    """แปลงค่าตัวเลขอย่างปลอดภัย รองรับเครื่องหมายขีด ค่าว่าง และเศษส่วน"""
     if val is None:
         return default
     try:
@@ -63,6 +64,7 @@ def safe_float(val, default=0.0):
         return default
 
 def calculate_prediction(record: Dict[str, Any]):
+    """คำนวณความเสี่ยงด้วยโมเดล XGBoost"""
     age = safe_float(record.get("age"))
     h = safe_float(record.get("height"))
     w = safe_float(record.get("weight"))
@@ -144,6 +146,7 @@ def calculate_prediction(record: Dict[str, Any]):
     return round(risk_probability, 2), tier
 
 def process_and_predict(record: Dict[str, Any]):
+    """คำนวณเคสเดี่ยวสำหรับ Webhook"""
     if not model or not supabase:
         return
     try:
@@ -154,14 +157,16 @@ def process_and_predict(record: Dict[str, Any]):
         supabase.table("records").update({
             "ai_risk_score": score,
             "ai_risk_tier": tier,
-            "ai_predicted_at": "now()"
+            "ai_predicted_at": datetime.now(timezone.utc).isoformat()
         }).eq("id", rec_id).execute()
         print(f"✅ บันทึกสำเร็จ {rec_id}: {score}% ({tier})")
     except Exception as e:
-        print(f"❌ Error processing record: {e}")
+        print(f"❌ Error processing record {record.get('id')}: {e}")
 
+# ====================================================================
+# ⚡ Background Worker แบบ High-Efficiency Batch Upsert (ถนอมฐานข้อมูล)
+# ====================================================================
 def run_batch_worker(targets: List[Dict[str, Any]]):
-    """ฟังก์ชันเบื้องหลังประมวลผลคู่ขนาน 15 Threads"""
     global batch_tracker
     batch_tracker["is_running"] = True
     batch_tracker["status"] = "running"
@@ -170,33 +175,52 @@ def run_batch_worker(targets: List[Dict[str, Any]]):
     batch_tracker["errors"] = 0
     batch_tracker["message"] = f"กำลังประมวลผล {len(targets)} รายการ..."
 
-    def update_single(r):
+    # 1. คำนวณความเสี่ยงทั้งหมดบน RAM (ใช้เวลาเสี้ยววินาที)
+    updates_payload = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    for r in targets:
         rec_id = r.get("id")
         if not rec_id:
-            return False
+            continue
         try:
             score, tier = calculate_prediction(r)
-            supabase.table("records").update({
+            updates_payload.append({
+                "id": rec_id,
                 "ai_risk_score": score,
                 "ai_risk_tier": tier,
-                "ai_predicted_at": "now()"
-            }).eq("id", rec_id).execute()
-            return True
-        except Exception:
-            return False
+                "ai_predicted_at": now_iso
+            })
+        except Exception as pred_err:
+            print(f"⚠️ คำนวณไม่สำเร็จ ID {rec_id}: {pred_err}")
+            batch_tracker["errors"] += 1
 
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        results = list(executor.map(update_single, targets))
-
-    success_count = sum(1 for res in results if res)
-    error_count = len(results) - success_count
+    # 2. บันทึกกลับ Supabase เป็นกลุ่ม (Chunk ละ 50 รายการ) ประหยัด Connection Pool 50 เท่า
+    chunk_size = 50
+    for i in range(0, len(updates_payload), chunk_size):
+        chunk = updates_payload[i:i + chunk_size]
+        try:
+            supabase.table("records").upsert(chunk).execute()
+            batch_tracker["processed"] += len(chunk)
+        except Exception as chunk_err:
+            print(f"⚠️ Upsert เป็นกลุ่มไม่ผ่าน สลับใช้ Fallback อัปเดตทีละเคส: {chunk_err}")
+            # Fallback: หากตารางติดเงื่อนไข Schema พิเศษ จะสลับมาอัปเดตเฉพาะแถวนั้นโดยไม่สะดุด
+            for item in chunk:
+                try:
+                    supabase.table("records").update({
+                        "ai_risk_score": item["ai_risk_score"],
+                        "ai_risk_tier": item["ai_risk_tier"],
+                        "ai_predicted_at": item["ai_predicted_at"]
+                    }).eq("id", item["id"]).execute()
+                    batch_tracker["processed"] += 1
+                except Exception as single_err:
+                    print(f"❌ Fallback Error {item.get('id')}: {single_err}")
+                    batch_tracker["errors"] += 1
 
     batch_tracker["is_running"] = False
     batch_tracker["status"] = "completed"
-    batch_tracker["processed"] = success_count
-    batch_tracker["errors"] = error_count
-    batch_tracker["message"] = f"ประมวลผลเสร็จสิ้น {success_count} รายการ (ข้อผิดพลาด {error_count} รายการ)"
-    print(f"🎉 Batch Process Completed: {success_count}/{len(targets)}")
+    batch_tracker["message"] = f"ประมวลผลเสร็จสิ้น {batch_tracker['processed']} รายการ (ข้อผิดพลาด {batch_tracker['errors']} รายการ)"
+    print(f"🎉 Batch Process Finished: {batch_tracker['processed']}/{len(targets)}")
 
 @app.get("/")
 def health_check():
@@ -215,6 +239,7 @@ async def supabase_webhook(payload: Dict[str, Any], background_tasks: Background
     if not record:
         raise HTTPException(status_code=400, detail="No record found in payload")
 
+    # 🛡️ ตัดลูป: ข้ามการประมวลผลหากเป็นการอัปเดตคะแนนจาก AI เอง
     if event_type == "UPDATE" and old_record:
         clinical_keys = ["age", "weight", "height", "waist", "sys", "dia", "bp", "sugar", "fasting", "smoking", "alcohol", "family", "gender"]
         has_clinical_change = any(str(record.get(k) or "").strip() != str(old_record.get(k) or "").strip() for k in clinical_keys)
@@ -225,7 +250,7 @@ async def supabase_webhook(payload: Dict[str, Any], background_tasks: Background
     return {"status": "queued", "record_id": record.get("id")}
 
 # ====================================================================
-# ⚡ จุดประมวลผลย้อนหลัง (ความเร็วสูง + ไม่ติด Timeout)
+# ⚡ จุดเรียกใช้งาน Batch Run จากภายนอก
 # ====================================================================
 @app.get("/batch/run")
 @app.post("/batch/run")
@@ -261,14 +286,13 @@ def batch_run_prediction(force_all: bool = False, background_tasks: BackgroundTa
                 "target_count": 0
             }
 
-        # ส่งไปทำงานเบื้องหลังทันที ไม่รอให้เบราว์เซอร์ค้าง
         background_tasks.add_task(run_batch_worker, targets)
 
         return {
             "status": "started",
-            "message": f"ระบบเริ่มประมวลผล {len(targets)} รายการในพื้นหลังเรียบร้อยแล้ว (ใช้ระบบ 15 Threads คู่ขนาน)",
+            "message": f"ระบบเริ่มประมวลผล {len(targets)} รายการในพื้นหลังเรียบร้อยแล้ว (ใช้ระบบ Batch Upsert)",
             "total_targets": len(targets),
-            "estimated_time": "ประมาณ 20-30 วินาที",
+            "estimated_time": "ประมาณ 10-15 วินาที",
             "check_status_url": "https://web-service-u8aj.onrender.com/batch/status"
         }
 
@@ -277,7 +301,7 @@ def batch_run_prediction(force_all: bool = False, background_tasks: BackgroundTa
 
 @app.get("/batch/status")
 def get_batch_status():
-    """เปิดดูความคืบหน้าแบบ Real-time"""
+    """เปิดดูสถานะและความคืบหน้าแบบ Real-time"""
     global batch_tracker
     pct = 0.0
     if batch_tracker["total"] > 0:
