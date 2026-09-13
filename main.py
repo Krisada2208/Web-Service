@@ -5,6 +5,7 @@ import numpy as np
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from typing import Dict, Any, List
 from supabase import create_client, Client
+from concurrent.futures import ThreadPoolExecutor
 
 app = FastAPI(title="NCD Progression AI Service")
 
@@ -38,8 +39,17 @@ try:
 except Exception as e:
     print(f"❌ เกิดข้อผิดพลาดขณะโหลดไฟล์โมเดล: {e}")
 
+# ตัวติดตามสถานะการประมวลผล Batch
+batch_tracker = {
+    "is_running": False,
+    "status": "idle",
+    "total": 0,
+    "processed": 0,
+    "errors": 0,
+    "message": "ยังไม่มีการประมวลผล Batch ในขณะนี้"
+}
+
 def safe_float(val, default=0.0):
-    """แปลงค่าตัวเลขอย่างปลอดภัย หากเจอ '-', ค่าว่าง หรือข้อความ จะคืนค่า default ทันที ไม่ Crash"""
     if val is None:
         return default
     try:
@@ -53,7 +63,6 @@ def safe_float(val, default=0.0):
         return default
 
 def calculate_prediction(record: Dict[str, Any]):
-    """คำนวณความเสี่ยงด้วยโมเดล XGBoost พร้อมระบบแปลงข้อมูลรอบคอบ"""
     age = safe_float(record.get("age"))
     h = safe_float(record.get("height"))
     w = safe_float(record.get("weight"))
@@ -151,6 +160,44 @@ def process_and_predict(record: Dict[str, Any]):
     except Exception as e:
         print(f"❌ Error processing record: {e}")
 
+def run_batch_worker(targets: List[Dict[str, Any]]):
+    """ฟังก์ชันเบื้องหลังประมวลผลคู่ขนาน 15 Threads"""
+    global batch_tracker
+    batch_tracker["is_running"] = True
+    batch_tracker["status"] = "running"
+    batch_tracker["total"] = len(targets)
+    batch_tracker["processed"] = 0
+    batch_tracker["errors"] = 0
+    batch_tracker["message"] = f"กำลังประมวลผล {len(targets)} รายการ..."
+
+    def update_single(r):
+        rec_id = r.get("id")
+        if not rec_id:
+            return False
+        try:
+            score, tier = calculate_prediction(r)
+            supabase.table("records").update({
+                "ai_risk_score": score,
+                "ai_risk_tier": tier,
+                "ai_predicted_at": "now()"
+            }).eq("id", rec_id).execute()
+            return True
+        except Exception:
+            return False
+
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        results = list(executor.map(update_single, targets))
+
+    success_count = sum(1 for res in results if res)
+    error_count = len(results) - success_count
+
+    batch_tracker["is_running"] = False
+    batch_tracker["status"] = "completed"
+    batch_tracker["processed"] = success_count
+    batch_tracker["errors"] = error_count
+    batch_tracker["message"] = f"ประมวลผลเสร็จสิ้น {success_count} รายการ (ข้อผิดพลาด {error_count} รายการ)"
+    print(f"🎉 Batch Process Completed: {success_count}/{len(targets)}")
+
 @app.get("/")
 def health_check():
     return {
@@ -178,18 +225,23 @@ async def supabase_webhook(payload: Dict[str, Any], background_tasks: Background
     return {"status": "queued", "record_id": record.get("id")}
 
 # ====================================================================
-# ⚡ จุดประมวลผลย้อนหลัง (Batch Run)
+# ⚡ จุดประมวลผลย้อนหลัง (ความเร็วสูง + ไม่ติด Timeout)
 # ====================================================================
 @app.get("/batch/run")
 @app.post("/batch/run")
-def batch_run_prediction(force_all: bool = False):
-    if not model:
-        raise HTTPException(status_code=500, detail="โมเดลยังไม่พร้อมใช้งาน")
-    if not supabase:
-        raise HTTPException(status_code=500, detail="ยังไม่ได้เชื่อมต่อ Supabase")
+def batch_run_prediction(force_all: bool = False, background_tasks: BackgroundTasks = None):
+    global batch_tracker
+    if batch_tracker["is_running"]:
+        return {
+            "status": "already_running",
+            "message": "ระบบกำลังประมวลผล Batch อยู่ในขณะนี้ กรุณารอสักครู่",
+            "progress": f"{batch_tracker['processed']}/{batch_tracker['total']}"
+        }
+
+    if not model or not supabase:
+        raise HTTPException(status_code=500, detail="โมเดลหรือ Supabase ยังไม่พร้อมใช้งาน")
 
     try:
-        # ดึงข้อมูลจากตาราง records สูงสุด 5,000 แถว
         res = supabase.table("records").select("*").limit(5000).execute()
         all_records = res.data or []
 
@@ -199,42 +251,44 @@ def batch_run_prediction(force_all: bool = False):
             s = str(val).strip()
             return s in ["", "-", "null", "None"]
 
-        # เลือกว่าจะประมวลผลเฉพาะคนที่ยังไม่มีคะแนน หรือประมวลผลใหม่ทุกคน
         targets = all_records if force_all else [r for r in all_records if is_empty_score(r.get("ai_risk_score"))]
 
-        updated_count = 0
-        error_count = 0
-        error_details = []
-        processed_logs = []
+        if not targets:
+            return {
+                "status": "success",
+                "message": "ไม่มีรายการที่ต้องประมวลผล (มีคะแนนครบถ้วนแล้ว)",
+                "total_in_db": len(all_records),
+                "target_count": 0
+            }
 
-        for r in targets:
-            rec_id = r.get("id")
-            if not rec_id:
-                continue
-            try:
-                score, tier = calculate_prediction(r)
-                supabase.table("records").update({
-                    "ai_risk_score": score,
-                    "ai_risk_tier": tier,
-                    "ai_predicted_at": "now()"
-                }).eq("id", rec_id).execute()
-                
-                updated_count += 1
-                name = (r.get("prefix") or "") + (r.get("name") or "")
-                processed_logs.append(f"{name} ({rec_id}): {score}% ({tier})")
-            except Exception as item_err:
-                error_count += 1
-                error_details.append(f"ID {rec_id}: {str(item_err)}")
+        # ส่งไปทำงานเบื้องหลังทันที ไม่รอให้เบราว์เซอร์ค้าง
+        background_tasks.add_task(run_batch_worker, targets)
 
         return {
-            "status": "success",
-            "message": f"ประมวลผลสำเร็จ {updated_count} รายการ (ข้อผิดพลาด {error_count} รายการ)",
-            "total_in_db": len(all_records),
-            "target_count": len(targets),
-            "processed_count": updated_count,
-            "errors": error_details[:5],
-            "sample_results": processed_logs[:10]
+            "status": "started",
+            "message": f"ระบบเริ่มประมวลผล {len(targets)} รายการในพื้นหลังเรียบร้อยแล้ว (ใช้ระบบ 15 Threads คู่ขนาน)",
+            "total_targets": len(targets),
+            "estimated_time": "ประมาณ 20-30 วินาที",
+            "check_status_url": "https://web-service-u8aj.onrender.com/batch/status"
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการรัน Batch: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาด: {str(e)}")
+
+@app.get("/batch/status")
+def get_batch_status():
+    """เปิดดูความคืบหน้าแบบ Real-time"""
+    global batch_tracker
+    pct = 0.0
+    if batch_tracker["total"] > 0:
+        pct = round((batch_tracker["processed"] / batch_tracker["total"]) * 100, 1)
+    
+    return {
+        "status": batch_tracker["status"],
+        "is_running": batch_tracker["is_running"],
+        "progress_percent": f"{pct}%",
+        "processed": batch_tracker["processed"],
+        "total": batch_tracker["total"],
+        "errors": batch_tracker["errors"],
+        "message": batch_tracker["message"]
+    }
