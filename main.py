@@ -147,9 +147,30 @@ def health_check():
 
 @app.post("/webhook/predict")
 async def supabase_webhook(payload: Dict[str, Any], background_tasks: BackgroundTasks):
+    """จุดรับ Webhook จาก Supabase พร้อมระบบตัดลูปวนซ้ำ (Infinite Loop Guard)"""
+    event_type = payload.get("type")
     record = payload.get("record")
+    old_record = payload.get("old_record")
+
     if not record:
-        raise HTTPException(status_code=400, detail="No record found")
+        raise HTTPException(status_code=400, detail="No record found in payload")
+
+    # 🛡️ ตัดลูป: ถ้าเป็นการ UPDATE ให้เช็กว่าค่าสัญญาณชีพเปลี่ยนจริงหรือไม่
+    if event_type == "UPDATE" and old_record:
+        clinical_keys = [
+            "age", "weight", "height", "waist", "sys", "dia", "bp", 
+            "sugar", "fasting", "smoking", "alcohol", "family", "gender"
+        ]
+        # ถ้าสัญญาณชีพและพฤติกรรมเหมือนเดิมทุกประการ แปลว่าเป็นการ Update จากตัว AI เอง -> สั่งข้ามทันที
+        has_clinical_change = any(
+            str(record.get(k) or "").strip() != str(old_record.get(k) or "").strip() 
+            for k in clinical_keys
+        )
+
+        if not has_clinical_change:
+            return {"status": "skipped", "message": "ข้ามการทำงาน: เป็นการอัปเดตคะแนนจาก AI"}
+
+    # สั่งประมวลผลเบื้องหลังตามปกติ
     background_tasks.add_task(process_and_predict, record)
     return {"status": "queued", "record_id": record.get("id")}
 
