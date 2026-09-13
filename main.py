@@ -3,44 +3,52 @@ import joblib
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
 from typing import Dict, Any
 from supabase import create_client, Client
 
 app = FastAPI(title="NCD Progression AI Service")
 
-# 1. เชื่อมต่อ Supabase ผ่าน Environment Variables
+# 1. เชื่อมต่อ Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("✅ เชื่อมต่อ Supabase สำเร็จ")
+    except Exception as e:
+        print(f"⚠️ ไม่สามารถเชื่อมต่อ Supabase ได้: {e}")
 
-# -------------------------------------------------------------
-# กำหนด Path แบบ Absolute อ้างอิงจากตำแหน่งของไฟล์ main.py เสมอ
-# -------------------------------------------------------------
+# 2. โหลดโมเดลด้วย Absolute Path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "model", "ncd_progression_xgb.joblib")
 FEATURE_PATH = os.path.join(BASE_DIR, "model", "progression_features.joblib")
 
-# ตรวจสอบการมีอยู่ของไฟล์ก่อนโหลด
-if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(f"ไม่พบไฟล์โมเดลที่: {MODEL_PATH}")
-if not os.path.exists(FEATURE_PATH):
-    raise FileNotFoundError(f"ไม่พบไฟล์ Features ที่: {FEATURE_PATH}")
+model = None
+feature_cols = None
 
-model = joblib.load(MODEL_PATH)
-feature_cols = joblib.load(FEATURE_PATH)
+try:
+    print(f"กำลังตรวจสอบไฟล์ที่: {MODEL_PATH}")
+    if os.path.exists(MODEL_PATH) and os.path.exists(FEATURE_PATH):
+        model = joblib.load(MODEL_PATH)
+        feature_cols = joblib.load(FEATURE_PATH)
+        print("✅ โหลดโมเดล XGBoost และ Features สำเร็จ")
+    else:
+        print("❌ ไม่พบไฟล์โมเดลในโฟลเดอร์ model/")
+except Exception as e:
+    print(f"❌ เกิดข้อผิดพลาดขณะโหลดไฟล์โมเดล: {e}")
 
 def process_and_predict(record: Dict[str, Any]):
-    """ฟังก์ชันประมวลผลเบื้องหลัง (Background Task) คำนวณความเสี่ยงและอัปเดตกลับ Supabase"""
+    if not model or not feature_cols:
+        print("⚠️ ข้ามการประมวลผล: ยังไม่ได้โหลดโมเดล")
+        return
+
     try:
         rec_id = record.get("id")
         if not rec_id:
             return
 
-        # แปลงข้อมูลสรีรวิทยา
         age = float(record.get("age") or 0)
         h = float(record.get("height") or 0)
         w = float(record.get("weight") or 0)
@@ -49,21 +57,19 @@ def process_and_predict(record: Dict[str, Any]):
         bmi = round(w / ((h / 100) ** 2), 2) if h > 0 else 0
         whtr = round(waist / h, 2) if h > 0 else 0
 
-        # จัดการความดัน SYS / DIA (ดึงจาก bp หากช่องแยกไม่มีค่า)
         sys = float(record.get("sys") or 0)
         dia = float(record.get("dia") or 0)
         bp = str(record.get("bp") or "")
         if (sys == 0 or dia == 0) and "/" in bp:
             parts = bp.split("/")
             if len(parts) >= 2:
-                sys = float(parts[0]) if parts[0].isdigit() else 0
-                dia = float(parts[1]) if parts[1].isdigit() else 0
+                sys = float(parts[0]) if parts[0].strip().isdigit() else 0
+                dia = float(parts[1]) if parts[1].strip().isdigit() else 0
 
         pulse_pressure = sys - dia
         map_pressure = round(dia + (pulse_pressure / 3.0), 2)
         sugar = float(record.get("sugar") or 0)
 
-        # การถอดรหัสพฤติกรรม (Encoding ให้ตรงกับตอนเทรน)
         gender_code = 1 if str(record.get("gender") or "").strip() == "ชาย" else 0
         fasting_code = 1 if str(record.get("fasting") or "").strip() == "yes" else 0
 
@@ -93,7 +99,6 @@ def process_and_predict(record: Dict[str, Any]):
         else:
             family_code = 0
 
-        # สร้าง DataFrame 1 แถวป้อนให้โมเดล
         input_dict = {
             "age": age,
             "gender_code": gender_code,
@@ -112,11 +117,8 @@ def process_and_predict(record: Dict[str, Any]):
         }
         
         input_df = pd.DataFrame([input_dict])[feature_cols]
-
-        # คำนวณค่าความน่าจะเป็นของการลุกลาม (0 - 100%)
         risk_probability = float(model.predict_proba(input_df)[:, 1][0]) * 100
 
-        # แบ่งกลุ่มความเสี่ยงทางการแพทย์ (Risk Tiers)
         if risk_probability >= 70.0:
             tier = "วิกฤต/เสี่ยงสูงมาก (High Risk)"
         elif risk_probability >= 40.0:
@@ -124,30 +126,30 @@ def process_and_predict(record: Dict[str, Any]):
         else:
             tier = "ความเสี่ยงต่ำ (Low Risk)"
 
-        # เขียนผลลัพธ์กลับลงตาราง records ของ Supabase
         if supabase:
             supabase.table("records").update({
                 "ai_risk_score": round(risk_probability, 2),
                 "ai_risk_tier": tier,
                 "ai_predicted_at": "now()"
             }).eq("id", rec_id).execute()
-
-            print(f"Record {rec_id} ประมวลผลสำเร็จ: {risk_probability:.2f}% ({tier})")
+            print(f"✅ บันทึกผลสำเร็จ {rec_id}: {risk_probability:.2f}% ({tier})")
 
     except Exception as e:
-        print(f"Error processing prediction for record: {str(e)}")
+        print(f"❌ เกิดข้อผิดพลาดในการคำนวณ: {e}")
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "model": "XGBoost NCD Progression"}
+    return {
+        "status": "online",
+        "model_loaded": model is not None,
+        "features": feature_cols
+    }
 
 @app.post("/webhook/predict")
 async def supabase_webhook(payload: Dict[str, Any], background_tasks: BackgroundTasks):
-    """จุดรับ Webhook จาก Supabase"""
     record = payload.get("record")
     if not record:
-        raise HTTPException(status_code=400, detail="No record found in payload")
+        raise HTTPException(status_code=400, detail="No record found")
 
-    # สั่งประมวลผลเบื้องหลังทันทีเพื่อป้องกัน Timeout (ตอบกลับ Supabase ภายในไม่กี่ ms)
     background_tasks.add_task(process_and_predict, record)
     return {"status": "queued", "record_id": record.get("id")}
